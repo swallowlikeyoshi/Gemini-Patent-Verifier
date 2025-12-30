@@ -1,9 +1,5 @@
 .env
 
-# Allow README.md
-!README.md
-*.md
-
 _*.py
 
 __pycache__/
