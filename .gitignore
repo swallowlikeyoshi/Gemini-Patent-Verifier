@@ -1,3 +1,11 @@
 .env
 
 *.md
+
+_*.py
+
+__pycache__/
+
+responses/
+
+.venv/
