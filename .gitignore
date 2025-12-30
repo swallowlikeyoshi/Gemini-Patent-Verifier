@@ -1,5 +1,7 @@
 .env
 
+# Allow README.md
+!README.md
 *.md
 
 _*.py
@@ -7,5 +9,3 @@ _*.py
 __pycache__/
 
 responses/
-
-.venv/
