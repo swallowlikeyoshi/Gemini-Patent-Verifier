@@ -1,9 +1,104 @@
 import asyncio
 import os
+import json
+from datetime import datetime
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from mcp_connector import get_kipris_connector
+
+class GeminiDebugLogger:
+    def __init__(self):
+        self.steps = []
+        self.gemini_api_call_count = 0
+        self.kipris_api_call_count = 0
+        self.start_time = datetime.now()
+        self.total_tokens = None
+
+    def log_api_call(self, role, content=None, function_calls=None):
+        if role == "model":
+            self.gemini_api_call_count += 1
+        
+        entry = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "function_calls": function_calls,
+            "turn": self.gemini_api_call_count if role == "model" else 0
+        }
+        self.steps.append(entry)
+
+    def log_tool_result(self, tool_name, result):
+        self.kipris_api_call_count += 1
+        self.steps.append({
+            "role": "tool",
+            "tool_name": tool_name,
+            "result": result,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "turn": self.gemini_api_call_count
+        })
+
+    def set_usage(self, usage):
+        self.total_tokens = usage
+
+    def generate_report(self):
+        report = [
+            "# Gemini API Flow Debug Log",
+            f"- **Date**: {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- **Total Gemini API Calls**: {self.gemini_api_call_count}",
+        ]
+        
+        if self.total_tokens:
+            report.append(f"- **Token Usage**: Prompt: {self.total_tokens.prompt_token_count}, Candidates: {self.total_tokens.candidates_token_count}, Total: {self.total_tokens.total_token_count}")
+        
+        report.append("\n## 💬 Communication Flow\n")
+        
+        for step in self.steps:
+            role = step['role']
+            time = step['timestamp']
+            
+            if role == "user":
+                report.append(f"### 👤 User (Input) *[{time}]*")
+                report.append(f"```text\n{step['content']}\n```\n")
+            
+            elif role == "model":
+                turn_label = f" (Turn {step['turn']})" if step['turn'] > 0 else ""
+                report.append(f"### 🤖 Gemini Response{turn_label} *[{time}]*")
+                
+                # Show text part if exists
+                if step['content']:
+                    report.append(f"**Thought/Draft**:\n\n{step['content']}\n")
+                
+                # Show function calls if exists
+                if step['function_calls']:
+                    report.append("#### 🛠️ Tool Usage (Function Calls)")
+                    for fc in step['function_calls']:
+                        args_json = json.dumps(fc.args, indent=2, ensure_ascii=False)
+                        report.append(f"- **Tool**: `{fc.name}`")
+                        report.append(f"- **Arguments**:\n```json\n  {args_json}\n```")
+                report.append("---")
+
+            elif role == "tool":
+                report.append(f"### 📥 Tool Result (`{step['tool_name']}`) *[{time}]*")
+                # Truncate very long tool results for readability
+                res_str = str(step['result'])
+                if len(res_str) > 2000:
+                    res_str = res_str[:2000] + "... (truncated)"
+                report.append(f"```json\n{res_str}\n```\n")
+
+        return "\n".join(report)
+
+    def save(self, folder="debug"):
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        
+        filename = f"api_flow_{self.start_time.strftime('%Y%m%d_%H%M%S')}.md"
+        path = os.path.join(folder, filename)
+        
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.generate_report())
+        
+        return path
 
 # PROMPT_1 with patent grounding instructions
 PROMPT_1 = """
@@ -43,16 +138,21 @@ async def main():
     google_search_tool = types.Tool(google_search=types.GoogleSearch())
     
     # 3. Combine tools
-    # Temporarily remove Google Search to troubleshoot "Tool use unsupported" error
-    mcp_tool = types.Tool(function_declarations=kipris_tools)
+    # Removed Google Search tool because it conflicts with custom function calling (error 400)
     config = types.GenerateContentConfig(
-        tools=[mcp_tool]
+        tools=[types.Tool(function_declarations=kipris_tools)]
     )
 
     full_prompt = f"{PROMPT_1}\n\n[광고 스크립트]:\n{SCRIPT}"
     history = [types.Content(role="user", parts=[types.Part(text=full_prompt)])]
+    
+    print("\nStart history: ", history, '\n')
 
-    print("Gemini에게 요청을 보내는 중 (KIPRIS 특허 검색 도구 포함)...")
+    # Init Logger
+    logger = GeminiDebugLogger()
+    logger.log_api_call("user", full_prompt)
+
+    print("Gemini에게 요청을 보내는 중(KIPRIS 특허 검색 도구 포함)...")
     
     try:
         response = client.models.generate_content(
@@ -61,8 +161,18 @@ async def main():
             config=config
         )
         
+        # Log first model response (could be text or tool call)
+        res_text = response.text if response.candidates[0].content.parts and any(p.text for p in response.candidates[0].content.parts) else "[Tool Call Only]"
+        logger.log_api_call("model", res_text, 
+                           function_calls=[p.function_call for p in response.candidates[0].content.parts if p.function_call])
+
         current_response = response
-        while current_response.candidates[0].content.parts and current_response.candidates[0].content.parts[0].function_call:
+        max_turns = 10
+        turn_count = 0
+        total_usage = response.usage_metadata
+
+        while turn_count < max_turns and current_response.candidates[0].content.parts and any(p.function_call for p in current_response.candidates[0].content.parts):
+            turn_count += 1
             # Add model's response (containing function calls) to history
             history.append(current_response.candidates[0].content)
             
@@ -76,10 +186,20 @@ async def main():
                     # Execute MCP tool
                     result = await connector.call_tool(name, args)
                     
+                    # Extract text content from result
+                    content_text = ""
+                    if hasattr(result, 'content') and isinstance(result.content, list):
+                        content_text = "\n".join([c.text for c in result.content if hasattr(c, 'text')])
+                    else:
+                        content_text = str(result)
+
+                    # Log Tool Result
+                    logger.log_tool_result(name, content_text)
+
                     # Format result for Gemini
                     tool_parts.append(types.Part.from_function_response(
                         name=name,
-                        response={"result": str(result.content)}
+                        response={"result": content_text}
                     ))
             
             if tool_parts:
@@ -92,16 +212,35 @@ async def main():
                     contents=history,
                     config=config
                 )
+                
+                # IMPORTANT: Accumulate Usage
+                if current_response.usage_metadata:
+                    total_usage.prompt_token_count += current_response.usage_metadata.prompt_token_count
+                    total_usage.candidates_token_count += current_response.usage_metadata.candidates_token_count
+                    total_usage.total_token_count += current_response.usage_metadata.total_token_count
+
+                # IMPORTANT: Log EVERY response from Gemini inside the loop
+                inner_text = current_response.text if current_response.candidates[0].content.parts and any(p.text for p in current_response.candidates[0].content.parts) else "[Tool Call Only]"
+                logger.log_api_call("model", inner_text,
+                                   function_calls=[p.function_call for p in current_response.candidates[0].content.parts if p.function_call])
             else:
                 break
         
-        final_text = current_response.text
+        if turn_count >= max_turns:
+            print(f"경고: 최대 도구 호출 횟수({max_turns})에 도달하여 루프를 종료합니다.")
+
+        final_text = current_response.text if current_response.candidates[0].content.parts and any(p.text for p in current_response.candidates[0].content.parts) else "분석 결과를 생성하지 못했습니다."
         print("\n[최종 분석 결과]\n")
         print(final_text)
 
-        # Citation handling (simplified for this version)
+        # Citation handling
         text_with_citations = add_citations(current_response)
         
+        # Finalize Usage and Log
+        logger.set_usage(total_usage)
+        debug_path = logger.save()
+        print(f"\n[Debug] 상세 API 호출 흐름이 저장되었습니다: {debug_path}")
+
         save_response_to_file(current_response.usage_metadata, PROMPT_1, text_with_citations)
 
     finally:
@@ -149,4 +288,5 @@ def save_response_to_file(token_usage, prompt_text, response_text, folder_path="
     print(f"Response saved to {new_file_path}")
 
 if __name__ == "__main__":
+    print("Start main")
     asyncio.run(main())
