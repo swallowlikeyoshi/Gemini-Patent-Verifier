@@ -5,3 +5,7 @@ _*.py
 __pycache__/
 
 # responses/
+
+*.txt
+
+.DS_Store
