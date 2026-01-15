@@ -6,6 +6,10 @@ __pycache__/
 
 # responses/
 
-*.txt
+*.txt   
 
 .DS_Store
+
+debug/
+
+responses/

@@ -1,7 +1,7 @@
 import asyncio
 import csv
 import os
-from grounding_test_mcp import main, PROMPT_3
+from grounding_test_mcp import main, PROMPT_5
 
 async def run_evaluation():
     csv_path = "source/scripts.csv"
@@ -36,7 +36,7 @@ async def run_evaluation():
         
         try:
             # Call Gemini API via the main function in grounding_test_mcp.py
-            analysis = await main(PROMPT_3, script)
+            analysis = await main(PROMPT_5, script)
         except Exception as e:
             analysis = f"Error during evaluation: {e}"
             print(f"Error evaluating {title}: {e}")
